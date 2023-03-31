@@ -4,12 +4,12 @@ export MASTER_ADDR=127.0.0.1
 export MASTER_PORT=$(python -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')
 
 SRC=src # file suffix of the source file
-DATA=/path/to/data/ # should contain train.$SRC and train.$TGT
-CONFIG=/path/to/model/config.json # the transformers model config
-TOKENIZER=/path/to/tokenizer # the transformers model or tokenizer dir
-REWARD_MODEL=/path/to/reward_model # the transformers reward model dir
-INIT_MODEL=/path/to/init_model # the transformers model dir
-SAVE=/path/to/save/dir # your saving dir
+DATA=preprocessed_data/ost/ # should contain train.$SRC and train.$TGT
+CONFIG=save/model-060k/config.json # the transformers model config
+TOKENIZER=save/model-060k/ # the transformers model or tokenizer dir
+REWARD_MODEL=save/model-060k/ # the transformers reward model dir
+INIT_MODEL=save/model-060k/ # the transformers model dir
+SAVE=save-ost-rl/ # your saving dir
 
 mkdir -p $SAVE
 cp $0 $SAVE/
@@ -29,7 +29,7 @@ python reinforce.py \
   --num-warmup-steps 4000 \
   --iter-per-update 4 \
   --save-dir $SAVE \
-  --update-per-save 1000 \
+  --update-per-save 4800 \
   -mn $INIT_MODEL \
   --reward-model $REWARD_MODEL \
   --fp32 \
@@ -40,6 +40,4 @@ python reinforce.py \
   --baseline \
   --softmax \
   --denom 100 \
-  --update-per-sync 5000 \
-  --length-discard \
-  | tee -a $SAVE/train.log
+  --update-per-sync 5000

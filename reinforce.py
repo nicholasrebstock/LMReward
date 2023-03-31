@@ -1,4 +1,5 @@
 import torch
+import traceback
 import transformers
 import argparse
 import os
@@ -13,6 +14,7 @@ from utils.dataset import DataCollector
 from utils.dataset import DatasetForSeq2Seq, BatchedDataset
 import copy
 import time
+import wandb
 
 
 def shift_left(tensor, fill_token_id):
@@ -111,102 +113,106 @@ class FP32Scaler(torch.cuda.amp.GradScaler):
 
 
 def actor_proc(queue, model, dataset, args, world_size, local_rank, device, free_to_go):
-    dataset = DataCollector(
-        dataset=dataset,
-        num_workers=args.num_workers // world_size,
-        rank=local_rank,
-        world_size=world_size,
-        shuffle=True,
-    )
-    logger.log('proc started')
-    config = model.config
-    amp_context = nullcontext() if args.fp32 else torch.cuda.amp.autocast()
-    epoch_length = len(dataset)
-    queue.put(epoch_length)
+    try:
+        dataset = DataCollector(
+            dataset=dataset,
+            num_workers=args.num_workers // world_size,
+            rank=local_rank,
+            world_size=world_size,
+            shuffle=True,
+        )
+        logger.log('proc started')
+        config = model.config
+        amp_context = nullcontext() if args.fp32 else torch.cuda.amp.autocast()
+        epoch_length = len(dataset)
+        queue.put(epoch_length)
 
-    while free_to_go.value == 0:
-        time.sleep(0.1)
+        while free_to_go.value == 0:
+            time.sleep(0.1)
 
-    with torch.no_grad(), amp_context:
-        while True:
-            dataiter = iter(dataset)
-            for _ in range(epoch_length):
-                data = next(dataiter)
-                model.eval()
-                enc_input = data['src']['input_ids'].to(device)
-                
-                model_kwargs = dict()
-                model_kwargs = model._prepare_encoder_decoder_kwargs_for_generation(
-                    enc_input, model_kwargs)
-                # set input_ids as decoder_input_ids
-                if "decoder_input_ids" in model_kwargs:
-                    input_ids = model_kwargs.pop("decoder_input_ids")
-                else:
-                    input_ids = model._prepare_decoder_input_ids_for_generation(
-                        enc_input.shape[0]
-                    )
-                input_ids, model_kwargs = model._expand_inputs_for_generation(
-                    input_ids,
-                    is_encoder_decoder=config.is_encoder_decoder, **model_kwargs
-                )
-                ready_mask = torch.zeros((enc_input.shape[0], 1)).bool().to(device=device)
-                
-                max_length = max(
-                    args.min_max_length,
-                    min(
-                        args.max_length,
-                        int(args.length_ratio * args.max_tokens - input_ids.numel()) // input_ids.shape[0]
-                    )
-                )
-                b_probs = []
-                for l in range(max_length):
-                    model_inputs = model.prepare_inputs_for_generation(
-                        input_ids, **model_kwargs)
-                    outputs = model(**model_inputs,
-                                    return_dict=True,
-                                    output_hidden_states=config.output_hidden_states,
-                                    output_attentions=config.output_attentions)
+        with torch.no_grad(), amp_context:
+            while True:
+                dataiter = iter(dataset)
+                for _ in range(epoch_length):
+                    data = next(dataiter)
+                    model.eval()
+                    enc_input = data['src']['input_ids'].to(device)
                     
-                    logits = outputs.logits[:, -1, :] / args.temperature # (beam, vocab)
-
-                    def top_k_mask_out(t, k, flat=False):
-                        _list = torch.topk(t, k, -1)[0]
-                        lb = _list[..., -1, None]
-                        # index = torch.argsort(t, dim=-1, descending=True)[..., _rep+k:]
-                        # return torch.scatter(t, -1, index, -torch.inf)
-                        if flat:
-                            return torch.where(t >= lb, 0.0, -torch.inf)
-                        return torch.masked_fill(t, t < lb, -torch.inf)
-                    if args.topk is not None:
-                        logits = top_k_mask_out(logits, args.topk, flat=(l==0) and args.init_flat)
-                    prob = torch.softmax(logits, -1) # (B, V)
-
-                    next_tokens = torch.multinomial(prob, 1) # (B, 1)
-                    b_probs.append(prob.gather(-1, next_tokens))
-
-                    next_tokens.masked_fill_(ready_mask, config.pad_token_id)
-                    eos_mask = next_tokens == config.eos_token_id
-                    
-                    input_ids = torch.cat([input_ids, next_tokens], dim=-1)
-                    model_kwargs = model._update_model_kwargs_for_generation(
-                        outputs, model_kwargs, is_encoder_decoder=config.is_encoder_decoder
+                    model_kwargs = dict()
+                    model_kwargs = model._prepare_encoder_decoder_kwargs_for_generation(
+                        enc_input, model_kwargs)
+                    # set input_ids as decoder_input_ids
+                    if "decoder_input_ids" in model_kwargs:
+                        input_ids = model_kwargs.pop("decoder_input_ids")
+                    else:
+                        input_ids = model._prepare_decoder_input_ids_for_generation(
+                            enc_input.shape[0]
+                        )
+                    input_ids, model_kwargs = model._expand_inputs_for_generation(
+                        input_ids=input_ids,
+                        is_encoder_decoder=config.is_encoder_decoder,
+                        **model_kwargs
                     )
+                    ready_mask = torch.zeros((enc_input.shape[0], 1)).bool().to(device=device)
+                    
+                    max_length = max(
+                        args.min_max_length,
+                        min(
+                            args.max_length,
+                            int(args.length_ratio * args.max_tokens - input_ids.numel()) // input_ids.shape[0]
+                        )
+                    )
+                    b_probs = []
+                    for l in range(max_length):
+                        model_inputs = model.prepare_inputs_for_generation(
+                            input_ids, **model_kwargs)
+                        outputs = model(**model_inputs,
+                                        return_dict=True,
+                                        output_hidden_states=config.output_hidden_states,
+                                        output_attentions=config.output_attentions)
+                        
+                        logits = outputs.logits[:, -1, :] / args.temperature # (beam, vocab)
 
-                    ready_mask = eos_mask | ready_mask
-                    if ready_mask.all():
-                        break
-                
-                b_probs = torch.cat(b_probs, dim=-1)
-                input_ids = input_ids[..., 1:]
+                        def top_k_mask_out(t, k, flat=False):
+                            _list = torch.topk(t, k, -1)[0]
+                            lb = _list[..., -1, None]
+                            # index = torch.argsort(t, dim=-1, descending=True)[..., _rep+k:]
+                            # return torch.scatter(t, -1, index, -torch.inf)
+                            if flat:
+                                return torch.where(t >= lb, 0.0, -torch.inf)
+                            return torch.masked_fill(t, t < lb, -torch.inf)
+                        if args.topk is not None:
+                            logits = top_k_mask_out(logits, args.topk, flat=(l==0) and args.init_flat)
+                        prob = torch.softmax(logits, -1) # (B, V)
 
-                ready_index = torch.arange(ready_mask.shape[0], device=ready_mask.device).masked_select(ready_mask.squeeze())
-                enc_input = enc_input.index_select(0, ready_index)
-                b_probs = b_probs.index_select(0, ready_index)
-                input_ids = input_ids.index_select(0, ready_index)
-                
-                queue.put((enc_input, input_ids, b_probs, ready_mask))
-                del data
-            del dataiter
+                        next_tokens = torch.multinomial(prob, 1) # (B, 1)
+                        b_probs.append(prob.gather(-1, next_tokens))
+
+                        next_tokens.masked_fill_(ready_mask, config.pad_token_id)
+                        eos_mask = next_tokens == config.eos_token_id
+                        
+                        input_ids = torch.cat([input_ids, next_tokens], dim=-1)
+                        model_kwargs = model._update_model_kwargs_for_generation(
+                            outputs, model_kwargs, is_encoder_decoder=config.is_encoder_decoder
+                        )
+
+                        ready_mask = eos_mask | ready_mask
+                        if ready_mask.all():
+                            break
+                    
+                    b_probs = torch.cat(b_probs, dim=-1)
+                    input_ids = input_ids[..., 1:]
+
+                    ready_index = torch.arange(ready_mask.shape[0], device=ready_mask.device).masked_select(ready_mask.squeeze())
+                    enc_input = enc_input.index_select(0, ready_index)
+                    b_probs = b_probs.index_select(0, ready_index)
+                    input_ids = input_ids.index_select(0, ready_index)
+                    
+                    queue.put((enc_input, input_ids, b_probs, ready_mask))
+                    del data
+                del dataiter
+    except:
+        logger.log(traceback.format_exc())
 
 
 class Trainer:
@@ -471,6 +477,9 @@ class Trainer:
             logging_str += format_str
         logger.log(logging_str)
 
+        # log to wandb
+        wandb.log(stats)
+
 
 def distributed_main(rank, args, model, dataset, tokenizer):
     dist.init_process_group(backend='nccl', rank=rank, world_size=args.world_size)
@@ -565,7 +574,7 @@ if __name__ == "__main__":
     parser.add_argument('--init-flat', action='store_true')
     parser.add_argument('--sent-level', action='store_true')
     args = parser.parse_args()
-
+    wandb.init()
     if args.model_name is None:
         setattr(args, 'model_name', os.path.join(args.save_dir, "model-last"))
     if args.tokenizer_name is None:
